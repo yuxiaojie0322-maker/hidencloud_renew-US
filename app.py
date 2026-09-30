@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,re,sys,time,random,requests
+import os,re,sys,time,random,requests,json
 from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
@@ -60,7 +60,7 @@ def send_telegram_notification(status, old_due, new_due):
 
     server_info = f"🖥️ 服务器: {SERVER_NAME}\n" if SERVER_NAME else ""
     text = (
-        f"🎉 HidenCloud 续期通知\n\n"
+        f"📢 HidenCloud 续期通知\n\n"
         f"{status}\n"
         f"{server_info}"
         f"👤 账号: {masked_email}\n"
@@ -243,7 +243,115 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
-def renew_service_single_attempt(page, server_id, attempt_num):
+def pay_invoice_thoroughly(page, invoice_url):
+    """在发票页面彻底完成支付与校验"""
+    log(f"💳 正在进入发票页面进行支付: {invoice_url}")
+    page.goto(invoice_url, wait_until="domcontentloaded", timeout=60000)
+    handle_cloudflare(page)
+    time.sleep(3)
+
+    # 1. 检查是否已经是已支付状态
+    body_text = page.locator("body").inner_text()
+    if ("paid" in body_text.lower() and "unpaid" not in body_text.lower()) or "status: paid" in body_text.lower():
+        log("✅ 发票已经是 Paid (已支付) 状态！")
+        return True
+
+    # 2. 打印发票页面表单结构供诊断
+    try:
+        form_info = page.evaluate('''() => {
+            const forms = Array.from(document.querySelectorAll('form')).map(f => ({
+                action: f.action,
+                method: f.method,
+                inputs: Array.from(f.querySelectorAll('input')).map(i => ({ name: i.name, type: i.type, value: i.value, checked: i.checked }))
+            }));
+            const buttons = Array.from(document.querySelectorAll('button, a')).map(b => b.textContent.trim()).filter(t => t.length > 0 && t.length < 40);
+            return { forms, buttons };
+        }''')
+        log(f"📝 发票页面元素: {json.dumps(form_info, ensure_ascii=False)}")
+    except Exception:
+        pass
+
+    # 3. 滚动到页面底部
+    page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+    time.sleep(1)
+
+    # 4. 勾选支付网关单选框与复选框
+    page.evaluate('''() => {
+        const radios = document.querySelectorAll('input[type="radio"]');
+        if (radios.length > 0 && !Array.from(radios).some(r => r.checked)) {
+            const pref = Array.from(radios).find(r => /credit|balance|free/i.test(r.value || r.name || r.id)) || radios[0];
+            pref.checked = true;
+            pref.click();
+        }
+        const cbs = document.querySelectorAll('input[type="checkbox"]');
+        cbs.forEach(cb => {
+            if (!cb.checked) {
+                cb.checked = true;
+                cb.click();
+            }
+        });
+    }''')
+    time.sleep(1)
+
+    # 5. 点击支付按钮与真实表单提交
+    pay_btn_locators = [
+        page.locator('button:has-text("Pay Now")').last,
+        page.locator('button:has-text("Pay the Free Invoice")').last,
+        page.locator('button:has-text("Pay")').last,
+        page.locator('input[type="submit"][value*="Pay"]').last
+    ]
+    
+    clicked = False
+    for p_loc in pay_btn_locators:
+        if p_loc.count() > 0:
+            try:
+                p_loc.scroll_into_view_if_needed(timeout=2000)
+                box = p_loc.bounding_box()
+                if box and box["width"] > 10:
+                    log(f"🖱️ 真实鼠标点击 Pay 按钮坐标 ({box['x'] + box['width']/2:.1f}, {box['y'] + box['height']/2:.1f})...")
+                    page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
+                    clicked = True
+                    break
+            except Exception as e:
+                log(f"⚠️ 坐标点击异常: {e}")
+
+    # 原生 JS requestSubmit 兜底触发真实提交
+    page.evaluate('''() => {
+        const payBtn = Array.from(document.querySelectorAll('button, input[type="submit"]')).find(el => /pay now|pay/i.test(el.textContent || el.value));
+        if (payBtn) {
+            const form = payBtn.closest('form');
+            if (form) {
+                if (typeof form.requestSubmit === 'function') {
+                    form.requestSubmit(payBtn);
+                } else {
+                    payBtn.click();
+                    form.submit();
+                }
+            } else {
+                payBtn.click();
+            }
+        }
+    }''')
+    log("✅ 支付提交指令已全量发送！")
+
+    # 6. 等待支付确认与状态回写 (拉长为 30 秒)
+    log("⏳ 等待支付完成确认（等待 30 秒）...")
+    time.sleep(30)
+    handle_cloudflare(page)
+
+    # 7. 刷新发票页验证结果
+    page.reload(wait_until="domcontentloaded")
+    handle_cloudflare(page)
+    time.sleep(2)
+    after_text = page.locator("body").inner_text()
+    if ("paid" in after_text.lower() and "unpaid" not in after_text.lower()) or "status: paid" in after_text.lower():
+        log("🎉 验证成功：发票状态已明确变更为 Paid！")
+        return True
+
+    log("ℹ️ 发票页面未直接显示 Paid，将在返回管理页后通过到期时间验证。")
+    return True
+
+def renew_service_single_attempt(page, server_id, attempt_num, old_due):
     """单次尝试执行完整的续费流程"""
     log(f"\n👉 [第 {attempt_num} 次全流程尝试] 正在进入服务管理页...")
     if page.url != SERVICE_URL:
@@ -251,7 +359,7 @@ def renew_service_single_attempt(page, server_id, attempt_num):
     handle_cloudflare(page)
     time.sleep(2)
 
-    # 1. 预检：如果已有未支付的发票，优先直接结算
+    # 1. 预检：如果已有未支付的发票，优先尝试结算并验证时间是否变化
     if server_id:
         try:
             unpaid_check_url = f"{BASE_URL}/service/{server_id}/invoices?where=unpaid"
@@ -263,23 +371,19 @@ def renew_service_single_attempt(page, server_id, attempt_num):
             if valid_invoices:
                 inv_url = valid_invoices[0]
                 target_url = inv_url if inv_url.startswith("http") else f"{BASE_URL}{inv_url if inv_url.startswith('/') else '/' + inv_url}"
-                log(f"⚡ 发现已存在未支付发票: {target_url}，直接进入支付...")
-                page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-                handle_cloudflare(page)
-                pay_btn = page.locator('button:has-text("Pay the Free Invoice"), button:has-text("Pay Now"), a:has-text("Pay"):visible, button:has-text("Pay"):visible, button:has-text("支付"):visible').first
-                if pay_btn.count() > 0:
-                    try:
-                        pay_btn.scroll_into_view_if_needed(timeout=3000)
-                        pay_btn.click(force=True, timeout=5000)
-                        log("✅ 'Pay' 按钮已通过 force click 点击。")
-                    except Exception:
-                        page.evaluate('() => { const b = document.querySelector("button[type=submit]") || Array.from(document.querySelectorAll("button, a")).find(el => /pay/i.test(el.textContent)); if (b) b.click(); }')
-                        log("✅ 'Pay' 按钮已通过 JS 触发提交。")
-                    log("⏳ 等待支付完成确认（等待 30 秒）...")
-                    time.sleep(30)
+                log(f"⚡ 发现已存在未支付发票: {target_url}，进入支付流程...")
+                pay_invoice_thoroughly(page, target_url)
+
+                # 结清后返回服务页，校验到期时间是否发生变化
                 page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
                 handle_cloudflare(page)
-                return True
+                time.sleep(3)
+                check_due = get_due_date(page)
+                if check_due != old_due and check_due != "未知":
+                    log(f"🎉 支付现有未支付账单后，到期时间已成功更新: {old_due} -> {check_due}")
+                    return True
+                else:
+                    log(f"⚠️ 现有发票结算后到期时间仍为 {check_due}，继续执行续费弹窗与新账单流程...")
         except Exception as e:
             log(f"⚠️ 预检发票跳过: {e}")
 
@@ -372,63 +476,48 @@ def renew_service_single_attempt(page, server_id, attempt_num):
         page.screenshot(path="renew_stuck_invoice.png")
         return False
 
-    if page.url != new_invoice_url:
-        page.goto(new_invoice_url)
-    handle_cloudflare(page)
+    # 4. 执行发票支付
+    pay_invoice_thoroughly(page, new_invoice_url)
 
-    log("🔎 查找 'Pay' 按钮...")
-    pay_btn = page.locator('button:has-text("Pay the Free Invoice"), button:has-text("Pay Now"), a:has-text("Pay"):visible, button:has-text("Pay"):visible, button:has-text("支付"):visible').first
-    pay_btn.wait_for(state="attached", timeout=30000)
-
-    # 彻底解决 element is outside of viewport 报错：force click + JS 提交
-    try:
-        pay_btn.scroll_into_view_if_needed(timeout=3000)
-        pay_btn.click(force=True, timeout=5000)
-        log("✅ 'Pay' 按钮已通过 force click 点击。")
-    except Exception as click_err:
-        log(f"⚠️ force click 遇阻 ({click_err})，使用 JS 模拟点击...")
-        page.evaluate('''() => {
-            const btn = document.querySelector('button[type="submit"]') || 
-                        Array.from(document.querySelectorAll('button, a')).find(el => /pay/i.test(el.textContent));
-            if (btn) {
-                btn.click();
-                if (btn.form) btn.form.submit();
-            }
-        }''')
-        log("✅ 'Pay' 按钮已通过 JS 触发提交。")
-
-    # 4. 付款后等待时间拉长为 30 秒
-    log("⏳ 等待支付确认页面跳转（等待 30 秒）...")
-    time.sleep(30)
-
+    # 5. 返回服务详情页，确认续费后到期时间
     page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
     handle_cloudflare(page)
-    return True
+    time.sleep(3)
+    final_due = get_due_date(page)
+    if final_due != old_due and final_due != "未知":
+        log(f"🎉 到期时间已成功增加: {old_due} -> {final_due}")
+        return True
+    else:
+        log(f"⚠️ 续费操作已执行，但到期时间仍显示为 {final_due}")
+        return False
 
 def renew_service(page):
     """外层封装：完整的 5 次重试保护机制"""
     m = re.search(r'/service/(\d+)', SERVICE_URL)
     server_id = m.group(1) if m else ""
 
+    old_due = get_due_date(page)
+    log(f"📆 续费前基准到期时间: {old_due}")
+
     log("➡ 进入续期流程 (最多重试 5 次)...")
     for attempt in range(1, 6):
         log(f"\n==================== 🔄 第 {attempt}/5 次续期全流程尝试 ====================")
         try:
-            res = renew_service_single_attempt(page, server_id, attempt)
+            res = renew_service_single_attempt(page, server_id, attempt, old_due)
             if res == "NOT_TIME":
                 return "NOT_TIME"
             if res is True:
-                log(f"🎉 第 {attempt} 次全流程续费成功！")
+                log(f"🎉 第 {attempt} 次全流程续费成功并确认到期时间已更新！")
                 return True
         except Exception as e:
             log(f"❌ 第 {attempt} 次尝试异常: {e}")
             page.screenshot(path=f"renew_attempt_{attempt}_error.png")
 
         if attempt < 5:
-            log(f"⚠️ 第 {attempt} 次未成功，等待 5 秒后进行第 {attempt+1} 次全流程重试...")
+            log(f"⚠️ 第 {attempt} 次未确认成功，等待 5 秒后进行第 {attempt+1} 次全流程重试...")
             time.sleep(5)
 
-    log("❌ 经过 5 次完整重试，续费仍未能完成。")
+    log("❌ 经过 5 次完整重试，到期时间未能成功增加。")
     return False
 
 def main():
@@ -476,26 +565,26 @@ def main():
 
             renew_result = renew_service(page)
 
-            new_due = old_due
+            new_due = get_due_date(page)
+            log(f"📆 续费后到期时间：{new_due}")
+
             if renew_result == "NOT_TIME":
                 log("⏳ 未到续期时间，目前无法续期")
                 status = "⏳ 未到续期时间"
-            elif renew_result is False:
-                log("❌ 续费失败，脚本退出。")
-                status = "❌ 续期失败"
+            elif renew_result is False or (new_due == old_due and new_due != "未知"):
+                log(f"❌ 续费未生效：续期前后到期时间均为 {new_due}")
+                status = "❌ 续期未生效 (到期时间未变)"
             else:
-                new_due = get_due_date(page)
-                log(f"📆 续费后到期时间：{new_due}")
                 status = "✅ 续期成功"
 
             send_telegram_notification(status, old_due, new_due)
 
             if renew_result == "NOT_TIME":
                 sys.exit(0)
-            elif renew_result is False:
-                sys.exit(1)
-            else:
+            elif status == "✅ 续期成功":
                 sys.exit(0)
+            else:
+                sys.exit(1)
         except Exception as e:
             log(f"❌ 浏览器启动出错: {e}")
             sys.exit(1)
