@@ -276,56 +276,71 @@ def send_notification(status: str, results: List[Dict[str, str]], outgoing_ip: s
             log(f"❌ 自定义 Webhook 发送异常: {e}")
 
 # ==================== Cloudflare Turnstile 验证处理 ====================
-def handle_cloudflare(page: Page, max_wait: int = 40) -> bool:
+def handle_cloudflare(page: Page, max_wait: int = 50) -> bool:
     """
-    智能处理 Cloudflare 5秒盾与 Turnstile 验证码
+    智能处理 Cloudflare 5秒盾、Security Verification 与 Turnstile 验证码
     """
-    iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
     start_time = time.time()
+    time.sleep(1.5)  # 等待页面与 iframe 开始加载
 
-    if page.locator(iframe_selector).count() == 0 and "Just a moment..." not in page.title():
-        return True
-
-    log("⚠️ 检测到 Cloudflare 验证拦截，正在尝试自动通过...")
-
-    while time.time() - start_time < max_wait:
-        if page.locator(iframe_selector).count() == 0 and "Just a moment..." not in page.title():
-            log("✅ Cloudflare 验证已通过！")
-            return True
-
+    def is_cf_present():
         try:
-            if page.locator(iframe_selector).count() > 0:
-                frame = page.frame_locator(iframe_selector).first
-                selectors = [
-                    'input[type="checkbox"]',
-                    '#cf-stage input',
-                    '.ctp-checkbox-label',
-                    '#challenge-stage span.mark'
-                ]
-                for sel in selectors:
-                    target = frame.locator(sel)
-                    if target.count() > 0 and target.first.is_visible():
-                        log("🖱️ 正在模拟点击 Cloudflare 复选框...")
-                        time.sleep(random.uniform(0.5, 1.2))
-                        box = target.first.bounding_box()
-                        if box:
-                            page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                            time.sleep(random.uniform(0.2, 0.4))
-                            page.mouse.down()
-                            time.sleep(random.uniform(0.05, 0.15))
-                            page.mouse.up()
-                        else:
-                            target.first.click(force=True)
-                        log("⏳ 已点击，等待 Turnstile 验证完成...")
-                        time.sleep(3.5)
-                        break
+            title = page.title().lower()
+            if "just a moment" in title or "security verification" in title:
+                return True
+            body = page.locator("body").inner_text().lower()
+            if "verify you are human" in body or "validating security" in body or "security verification" in body:
+                return True
         except Exception:
             pass
+        if page.locator('iframe[src*="cloudflare.com"], iframe[src*="challenges"]').count() > 0:
+            return True
+        return False
 
-        time.sleep(1.2)
+    if not is_cf_present():
+        return True
 
-    if page.locator(iframe_selector).count() == 0 and "Just a moment..." not in page.title():
-        log("✅ Cloudflare 验证最终通过！")
+    log("⚠️ 检测到 Cloudflare / Security Verification 验证，正在自动处理...")
+
+    last_click_time = 0
+    while time.time() - start_wait_cf < max_wait if 'start_wait_cf' in locals() else time.time() - start_time < max_wait:
+        if not is_cf_present():
+            log("✅ Cloudflare 验证已成功通过！")
+            time.sleep(2)
+            return True
+
+        now = time.time()
+        # 每隔 3.5 秒尝试定位并点击一次复选框
+        if now - last_click_time > 3.5:
+            last_click_time = now
+            try:
+                # 方案 1: 根据 iframe 坐标点击左侧复选框 (最有效，绕过跨域安全限制)
+                cf_iframe = page.locator('iframe[src*="challenges.cloudflare.com"], iframe[src*="cloudflare.com"]').first
+                if cf_iframe.count() > 0 and cf_iframe.is_visible():
+                    box = cf_iframe.bounding_box()
+                    if box and box["width"] > 40 and box["height"] > 25:
+                        click_x = box["x"] + min(28, box["width"] / 4)
+                        click_y = box["y"] + box["height"] / 2
+                        log(f"🖱️ 模拟点击 Turnstile 复选框坐标 ({click_x:.1f}, {click_y:.1f})...")
+                        page.mouse.move(click_x, click_y, steps=5)
+                        time.sleep(random.uniform(0.1, 0.25))
+                        page.mouse.down()
+                        time.sleep(random.uniform(0.05, 0.12))
+                        page.mouse.up()
+
+                # 方案 2: frame_locator 点击
+                if cf_iframe.count() > 0:
+                    frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]').first
+                    checkbox = frame.locator('input[type="checkbox"], .ctp-checkbox-label, #cf-stage, span.mark').first
+                    if checkbox.count() > 0 and checkbox.is_visible():
+                        checkbox.click(force=True)
+            except Exception:
+                pass
+
+        time.sleep(1)
+
+    if not is_cf_present():
+        log("✅ Cloudflare 验证通过！")
         return True
 
     log("❌ Cloudflare 验证超时。")
