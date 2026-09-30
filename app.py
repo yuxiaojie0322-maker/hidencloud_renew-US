@@ -233,7 +233,7 @@ def renew_service(page):
         modal_opened = False
         for i in range(3):
             try:
-                renew_btn.wait_for(state="visible", timeout=10000)
+                renew_btn.wait_for(state="visible", timeout=20000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
                 renew_btn.click()
@@ -248,7 +248,7 @@ def renew_service(page):
 
                 log("🖲️ 等待弹窗出现...")
                 try:
-                    create_btn.wait_for(state="visible", timeout=5000)
+                    create_btn.wait_for(state="visible", timeout=20000)
                     modal_opened = True
                     log("✅ 弹窗已成功弹出！")
                     break
