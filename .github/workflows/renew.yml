@@ -47,9 +47,9 @@ jobs:
           python -m playwright install --with-deps chrome
 
       - name: 🌐 配置代理 (sing-box)
-        if: "${{ secrets.NODE_LINK != '' }}"
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
+        if: env.NODE_LINK != ''
         run: |
           echo "检测到代理配置，正在尝试配置 sing-box..."
           bash <(wget -qO- --tries=3 --timeout=15 https://main.ssss.nyc.mn/setup_proxy.sh) || {
