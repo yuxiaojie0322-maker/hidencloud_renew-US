@@ -1,9 +1,19 @@
-name: Auto Renew HidenCloud 
+name: Auto Renew HidenCloud
 
 on:
   workflow_dispatch:
+    inputs:
+      notify_on_not_time:
+        description: '未到续期时间时是否也发送通知 (true / false)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
   schedule:
-    - cron: '30 05 * * 3' # 修改为每周一 05:30 (UTC 时间) 运行
+    # 每周一 05:30 (UTC 时间，即北京时间 13:30) 运行，可根据自己机器到期时间灵活调整
+    - cron: '30 5 * * 1'
 
 permissions:
   actions: write
@@ -15,40 +25,70 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: 📥 检出代码仓库
+        uses: actions/checkout@v4
 
-      - name: ⚙ 设置 Python
-        uses: actions/setup-python@v6
+      - name: ⚙ 设置 Python 环境
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: 🛠️ 安装系统依赖和 Python 依赖
+      - name: 🛠️ 安装系统与 Python 依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
-          pip install playwright requests 'requests[socks]'
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install playwright requests 'requests[socks]'
+          fi
           python -m playwright install --with-deps chrome
-          
-      - name: ⚙ 设置代理 (sing-box)
+
+      - name: 🌐 配置代理 (sing-box)
+        if: "${{ secrets.NODE_LINK != '' }}"
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-          
-      - name: 🚀 运行续期脚本
+          echo "检测到代理配置，正在尝试配置 sing-box..."
+          bash <(wget -qO- --tries=3 --timeout=15 https://main.ssss.nyc.mn/setup_proxy.sh) || {
+            echo "⚠️ 代理建立脚本异常，将继续以直连模式运行"
+          }
+
+      - name: 🚀 执行自动续期脚本
         env:
+          COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
+          COOKIE_NAME: ${{ secrets.COOKIE_NAME }}
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
-          COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
+          SERVER_NAME: ${{ secrets.SERVER_NAME }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          SERVER_NAME: ${{ secrets.SERVER_NAME }}
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          NOTIFY_ON_NOT_TIME: ${{ github.event.inputs.notify_on_not_time || secrets.NOTIFY_ON_NOT_TIME || 'true' }}
+          HEADLESS: 'false'
           IS_PROXY: ${{ env.IS_PROXY }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
 
-      - name: 🧽 清理进程和临时文件
+      - name: 📸 上传调试截图 (仅在存在截图时)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hidencloud-debug-screenshots
+          path: |
+            *.png
+            *.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 🧽 清理后台进程与临时文件
         if: always()
         run: |
           pkill -f sing-box || true
@@ -62,12 +102,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId' || echo "")
           count=0
           for run_id in $runs; do
             count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              echo "删除运行记录: $run_id"
+            if [ $count -gt 2 ]; then
+              echo "清理旧记录: $run_id"
               gh run delete $run_id || true
             fi
           done
