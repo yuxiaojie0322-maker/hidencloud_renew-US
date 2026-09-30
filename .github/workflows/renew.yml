@@ -13,7 +13,7 @@ on:
           - 'false'
   schedule:
     # 每周一 05:30 (UTC 时间，即北京时间 13:30) 运行，可根据自己机器到期时间灵活调整
-    - cron: '30 5 * * 1'
+    - cron: '30 5 * * 3'
 
 permissions:
   actions: write
