@@ -34,7 +34,6 @@ def get_current_ip(proxy_server=None):
     proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
     try:
         resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-        # log(f"请求出口IP完成, status={resp.status_code}")
         if resp.status_code == 200:
             return resp.text.strip()
         return "获取失败"
@@ -89,28 +88,48 @@ def send_telegram_notification(status, old_due, new_due):
         return False
 
 def handle_cloudflare(page):
-    iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
-    if page.locator(iframe_selector).count() == 0:
+    time.sleep(1.5)
+    def is_cf():
+        title = page.title().lower()
+        if "just a moment" in title or "security verification" in title:
+            return True
+        if page.locator('iframe[src*="challenges.cloudflare.com"], iframe[src*="cloudflare.com"]').count() > 0:
+            return True
+        return False
+
+    if not is_cf():
         return True
+
     log("⚠️ 检测到 Cloudflare 验证...")
     start_time = time.time()
+    last_click = 0
     while time.time() - start_time < 60:
-        if page.locator(iframe_selector).count() == 0:
+        if not is_cf():
             log("✅ Cloudflare 验证通过！")
             return True
-        try:
-            frame = page.frame_locator(iframe_selector)
-            checkbox = frame.locator('input[type="checkbox"]')
-            if checkbox.is_visible():
-                log("🖱️ 点击验证复选框...")
-                time.sleep(random.uniform(0.5, 1.5))
-                checkbox.click()
-                log("⏳ 已点击，等待验证结果...")
-                time.sleep(5)
-            else:
-                time.sleep(1)
-        except Exception:
-            pass
+        
+        now = time.time()
+        if now - last_click > 3.5:
+            last_click = now
+            try:
+                cf_iframe = page.locator('iframe[src*="challenges.cloudflare.com"], iframe[src*="cloudflare.com"]').first
+                if cf_iframe.count() > 0 and cf_iframe.is_visible():
+                    box = cf_iframe.bounding_box()
+                    if box and box["width"] > 40:
+                        page.mouse.click(box["x"] + min(28, box["width"] / 4), box["y"] + box["height"] / 2)
+                        log("🖱️ 点击验证复选框坐标...")
+                
+                frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]').first
+                checkbox = frame.locator('input[type="checkbox"]').first
+                if checkbox.count() > 0 and checkbox.is_visible():
+                    checkbox.click(force=True)
+            except Exception:
+                pass
+        time.sleep(1)
+
+    if not is_cf():
+        log("✅ Cloudflare 验证通过！")
+        return True
     log("❌ 验证超时。")
     return False
 
@@ -119,9 +138,13 @@ def login(page):
     if COOKIE_VALUE:
         log("📇 尝试 Cookie 登录...")
         try:
+            c_name = 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d'
+            c_val = COOKIE_VALUE
+            if '=' in COOKIE_VALUE and ';' not in COOKIE_VALUE:
+                c_name, c_val = COOKIE_VALUE.split('=', 1)
             page.context.add_cookies([{
-                'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
-                'value': COOKIE_VALUE,
+                'name': c_name.strip(),
+                'value': c_val.strip(),
                 'domain': 'dash.hidencloud.com',
                 'path': '/',
                 'expires': int(time.time()) + 3600 * 24 * 365,
@@ -133,12 +156,12 @@ def login(page):
             handle_cloudflare(page)
             page_title = page.title()
             log(f"📝 当前Title: {page_title}")
-            if "auth/login" not in page.url:
+            if "auth/login" not in page.url and ("/dashboard" in page.url or "/service" in page.url):
                 log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
                 return True
             log("❌ Cookie 失效，请更换")
-        except:
-            pass
+        except Exception as e:
+            log(f"⚠️ Cookie 登录异常: {e}")
 
     # 2. 账号密码登录
     if not EMAIL or not PASSWORD:
@@ -147,8 +170,8 @@ def login(page):
     try:
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
-        page.fill('input[name="email"]', EMAIL)
-        page.fill('input[name="password"]', PASSWORD)
+        page.fill('input[name="email"], input[type="email"]', EMAIL)
+        page.fill('input[name="password"], input[type="password"]', PASSWORD)
         time.sleep(0.5)
         handle_cloudflare(page)
         page.click('button[type="submit"]')
@@ -176,14 +199,12 @@ def get_server_id(page):
         html = page.content()
         log(f"📝 页面长度: {len(html)}, URL: {page.url}")
 
-        # 方案1: 从 href 链接中提取 /service/数字/manage
         matches = re.findall(r'/service/(\d+)/manage', html)
         if matches:
             server_id = matches[0]
             log(f"✅ 从链接中获取到 Server ID: {server_id}")
             return server_id
 
-        # 方案2: 从 span 标签中提取 #数字 (如 "Free Server #218079")
         matches = re.findall(r'#(\d{4,})', html)
         if matches:
             server_id = matches[0]
@@ -207,6 +228,8 @@ def get_due_date(page):
             r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
             r"Due date\s*\n\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
             r"Due date.*?(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+            r"(?:Due\s*date|到期时间|到期日)\s*[:：]?\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+            r"(?:Due\s*date|到期时间|到期日)\s*[:：]?\s*(\d{1,2}[-/]\d{1,2}[-/]\d{4})"
         ]
         for pattern in patterns:
             match = re.search(pattern, body_text, re.IGNORECASE | re.DOTALL)
@@ -219,19 +242,54 @@ def get_due_date(page):
     return "未知"
 
 def renew_service(page):
-
     try:
         log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
 
+        # 提取 server_id
+        m = re.search(r'/service/(\d+)', SERVICE_URL)
+        server_id = m.group(1) if m else ""
+
+        # 预检：如果已有未支付的发票，优先直接处理
+        if server_id:
+            try:
+                unpaid_check_url = f"{BASE_URL}/service/{server_id}/invoices?where=unpaid"
+                page.goto(unpaid_check_url, wait_until="domcontentloaded", timeout=30000)
+                handle_cloudflare(page)
+                time.sleep(2)
+                found_invoices = re.findall(r'href=["\']([^"\']*(?:/invoice/|/payment/invoice/)[^"\']*)["\']', page.content(), re.I)
+                valid_invoices = [lk for lk in found_invoices if 'download' not in lk.lower() and 'pdf' not in lk.lower()]
+                if valid_invoices:
+                    inv_url = valid_invoices[0]
+                    target_url = inv_url if inv_url.startswith("http") else f"{BASE_URL}{inv_url if inv_url.startswith('/') else '/' + inv_url}"
+                    log(f"⚡ 发现已存在未支付发票: {target_url}，直接进入支付...")
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                    handle_cloudflare(page)
+                    pay_btn = page.locator('button:has-text("Pay the Free Invoice"), a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+                    if pay_btn.count() > 0 and pay_btn.is_visible():
+                        pay_btn.click()
+                        log("✅ 'Pay' 按钮已点击。")
+                        log("⏳ 等待支付完成确认（等待 30 秒）...")
+                        time.sleep(30)
+                    page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                    handle_cloudflare(page)
+                    return True
+            except Exception as e:
+                log(f"⚠️ 预检发票跳过: {e}")
+
+            if page.url != SERVICE_URL:
+                page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                handle_cloudflare(page)
+
         log("🖱️ 准备点击 'Renew' 按钮...")
         renew_btn = page.locator('button:has-text("Renew")')
         create_btn = page.locator('button:has-text("Create Invoice")')
 
         modal_opened = False
-        for i in range(3):
+        # 重试的次数改成 5 次
+        for i in range(5):
             try:
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
@@ -244,17 +302,22 @@ def renew_service(page):
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
                     log("⚠️ 未到续期时间，无法续期。")
                     page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"   # 特殊状态
+                    return "NOT_TIME"
 
                 log("🖲️ 等待弹窗出现...")
                 try:
-                    create_btn.wait_for(state="visible", timeout=5000)
+                    create_btn.wait_for(state="visible", timeout=10000)
                     modal_opened = True
                     log("✅ 弹窗已成功弹出！")
                     break
                 except:
-                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
+                    log("⚠️ 弹窗未出现，尝试用 JS 点击 Renew...")
+                    page.evaluate('() => { const b = Array.from(document.querySelectorAll("button")).find(el => el.textContent.includes("Renew")); if (b) b.click(); }')
                     time.sleep(2)
+                    if create_btn.is_visible():
+                        modal_opened = True
+                        log("✅ JS点击成功弹出弹窗！")
+                        break
             except Exception as e:
                 log(f"❌ 点击尝试出错: {e}")
 
@@ -269,15 +332,38 @@ def renew_service(page):
 
         new_invoice_url = None
         start_wait = time.time()
-        while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url:
+        initial_pages_count = len(page.context.pages)
+        while time.time() - start_wait < 60:
+            if "/payment/invoice/" in page.url or "/invoice/" in page.url:
                 new_invoice_url = page.url
                 log(f"🎉 页面已跳转: {new_invoice_url}")
                 break
+            if len(page.context.pages) > initial_pages_count:
+                new_tab = page.context.pages[-1]
+                if "/invoice/" in new_tab.url or "/payment/" in new_tab.url:
+                    page = new_tab
+                    new_invoice_url = new_tab.url
+                    log(f"🎉 检测到新标签页打开: {new_invoice_url}")
+                    break
             if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
                 log("⚠️ 遇到拦截，尝试处理...")
                 handle_cloudflare(page)
             time.sleep(1)
+
+        # 兜底查询未支付账单列表
+        if not new_invoice_url and server_id:
+            log("⚠️ 页面未自动重定向发票页，主动前往未支付发票列表查询...")
+            try:
+                page.goto(f"{BASE_URL}/service/{server_id}/invoices?where=unpaid", wait_until="domcontentloaded", timeout=30000)
+                handle_cloudflare(page)
+                time.sleep(2)
+                found = re.findall(r'href=["\']([^"\']*(?:/invoice/|/payment/invoice/)[^"\']*)["\']', page.content(), re.I)
+                valid = [lk for lk in found if 'download' not in lk.lower() and 'pdf' not in lk.lower()]
+                if valid:
+                    new_invoice_url = valid[0] if valid[0].startswith("http") else f"{BASE_URL}{valid[0] if valid[0].startswith('/') else '/' + valid[0]}"
+                    log(f"🎯 主动匹配到未支付发票: {new_invoice_url}")
+            except Exception as e:
+                log(f"⚠️ 主动查询发票异常: {e}")
 
         if not new_invoice_url:
             log("❌ 未能进入发票页面，超时。")
@@ -289,13 +375,15 @@ def renew_service(page):
         handle_cloudflare(page)
 
         log("🔎 查找 'Pay' 按钮...")
-        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+        pay_btn = page.locator('button:has-text("Pay the Free Invoice"), a:has-text("Pay"):visible, button:has-text("Pay"):visible, button:has-text("支付"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
         pay_btn.click()
         log("✅ 'Pay' 按钮已点击。")
 
-        # 等待支付确认页面或跳转回服务页
-        time.sleep(5)
+        # 等待支付确认页面或跳转回服务页（拉长到 30 秒）
+        log("⏳ 等待支付确认页面跳转（等待 30 秒）...")
+        time.sleep(30)
+        
         # 返回服务管理页面以获取新的到期时间
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
@@ -363,7 +451,7 @@ def main():
             elif renew_result is False:
                 log("❌ 续费失败，脚本退出。")
                 status = "❌ 续期失败"
-            else:  # renew_result is True
+            else:
                 new_due = get_due_date(page)
                 log(f"📆 续费后到期时间：{new_due}")
                 status = "✅ 续期成功"
