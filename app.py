@@ -10,6 +10,7 @@ EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，�
 PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
 TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选
+SERVER_NAME  = os.environ.get('SERVER_NAME') or ""      # 服务器备注/名称,可选
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -59,9 +60,11 @@ def send_telegram_notification(status, old_due, new_due):
     else:
         masked_email = EMAIL[:2] + '****' 
 
+    server_info = f"🖥️ 服务器: {SERVER_NAME}\n" if SERVER_NAME else ""
     text = (
         f"🎉 HidenCloud 续期通知\n\n"
         f"{status}\n"
+        f"{server_info}"
         f"👤 账号: {masked_email}\n"
         f"📅 续期前到期：{old_due}\n"
         f"📅 续期后到期：{new_due}\n"
@@ -216,102 +219,68 @@ def get_due_date(page):
     return "未知"
 
 def renew_service(page):
+
     try:
-        log("\u27a1 进入续期流程...")
+        log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
 
-        log("\U0001f5b1\ufe0f 准备点击 'Renew' 按钮...")
-        renew_btn = page.locator('button:has-text("Renew")').first
-
-        # 新版页面：点击 Renew 后弹出 "Renew Plan" 弹窗（异步加载，需等待更久）
-        modal_title = page.locator('text="Renew Plan"').first
+        log("🖱️ 准备点击 'Renew' 按钮...")
+        renew_btn = page.locator('button:has-text("Renew")')
+        create_btn = page.locator('button:has-text("Create Invoice")')
 
         modal_opened = False
         for i in range(3):
             try:
-                renew_btn.wait_for(state="visible", timeout=15000)
+                renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
-                log(f"\U0001f5b1\ufe0f 第 {i + 1} 次尝试点击 'Renew'...")
+                log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
                 renew_btn.click()
 
-                # 检测是否出现"未到续期时间"提示
+                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
                 time.sleep(2)
                 page_text = page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
-                    log("\u26a0\ufe0f 未到续期时间，无法续期。")
+                    log("⚠️ 未到续期时间，无法续期。")
                     page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"
+                    return "NOT_TIME"   # 特殊状态
 
-                log("\U0001f5b2\ufe0f 等待 'Renew Plan' 弹窗出现...")
+                log("🖲️ 等待弹窗出现...")
                 try:
-                    modal_title.wait_for(state="visible", timeout=20000)
+                    create_btn.wait_for(state="visible", timeout=5000)
                     modal_opened = True
-                    log("\u2705 'Renew Plan' 弹窗已出现！")
+                    log("✅ 弹窗已成功弹出！")
                     break
-                except Exception:
-                    log("\u26a0\ufe0f 普通点击后弹窗未出现，尝试 JS 点击...")
-                    try:
-                        renew_btn.evaluate("el => el.click()")
-                        modal_title.wait_for(state="visible", timeout=20000)
-                        modal_opened = True
-                        log("\u2705 'Renew Plan' 弹窗已出现（JS 点击成功）！")
-                        break
-                    except Exception:
-                        log("\u26a0\ufe0f 弹窗仍未出现，准备重试...")
-                        time.sleep(2)
+                except:
+                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
+                    time.sleep(2)
             except Exception as e:
-                log(f"\u274c 点击尝试出错: {e}")
+                log(f"❌ 点击尝试出错: {e}")
 
         if not modal_opened:
-            try:
-                btns = page.locator("button:visible").all_inner_texts()
-                log(f"\U0001f50d 诊断-当前可见按钮: {[b.strip() for b in btns if b.strip()][:20]}")
-            except Exception:
-                pass
-            log("\u274c 错误：尝试多次后，续费弹窗仍未出现。")
+            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
             page.screenshot(path="renew_modal_failed.png")
             return False
 
         handle_cloudflare(page)
-
-        # 新版弹窗有 "Renew for" 下拉框，默认 "1 Week - €0.00" 已选中，一般无需改动
-        try:
-            if page.locator('text="Renew for"').count() > 0:
-                log("\U0001f4cb 检测到 'Renew for' 选项，使用默认周期")
-        except Exception:
-            pass
-
-        log("\U0001f5b1\ufe0f 点击 'Create Invoice'...")
-        create_btn = page.locator('button:has-text("Create Invoice")').first
-        create_btn.wait_for(state="visible", timeout=15000)
-        create_btn.scroll_into_view_if_needed()
+        log("🖱️ 点击 'Create Invoice'...")
         create_btn.click()
-
-        # 若点击后未跳转，JS 点击兜底
-        time.sleep(3)
-        if "/payment/invoice/" not in page.url:
-            try:
-                create_btn.evaluate("el => el.click()")
-                log("\U0001f501 已尝试 JS 点击 'Create Invoice'")
-            except Exception:
-                pass
 
         new_invoice_url = None
         start_wait = time.time()
         while time.time() - start_wait < 90:
             if "/payment/invoice/" in page.url:
                 new_invoice_url = page.url
-                log(f"\U0001f389 页面已跳转: {new_invoice_url}")
+                log(f"🎉 页面已跳转: {new_invoice_url}")
                 break
             if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-                log("\u26a0\ufe0f 遇到拦截，尝试处理...")
+                log("⚠️ 遇到拦截，尝试处理...")
                 handle_cloudflare(page)
             time.sleep(1)
 
         if not new_invoice_url:
-            log("\u274c 未能进入发票页面，超时。")
+            log("❌ 未能进入发票页面，超时。")
             page.screenshot(path="renew_stuck_invoice.png")
             return False
 
@@ -319,12 +288,11 @@ def renew_service(page):
             page.goto(new_invoice_url)
         handle_cloudflare(page)
 
-        log("\U0001f50e 查找 'Pay' 按钮...")
-        pay_btn = page.locator('button:text-is("Pay")').first
+        log("🔎 查找 'Pay' 按钮...")
+        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.scroll_into_view_if_needed()
         pay_btn.click()
-        log("\u2705 'Pay' 按钮已点击。")
+        log("✅ 'Pay' 按钮已点击。")
 
         # 等待支付确认页面或跳转回服务页
         time.sleep(5)
@@ -334,10 +302,9 @@ def renew_service(page):
         return True
 
     except Exception as e:
-        log(f"\u274c 续费异常: {e}")
+        log(f"❌ 续费异常: {e}")
         page.screenshot(path="renew_error.png")
         return False
-
 
 def main():
     # 检查必要环境变量
